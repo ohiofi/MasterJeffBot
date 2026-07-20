@@ -1,2 +1,3 @@
 # MasterJeffBot
-a Mastodon bot
+
+a Mastodon bot based on a McElroy family bit
