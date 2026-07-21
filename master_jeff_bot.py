@@ -6,14 +6,14 @@ import os
 import random
 import re
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont
 import logging
 from pathlib import Path
 from enum import Enum
 from color_schemes import THEMES
-
+import traceback
 
 DEBUG_MODE = False
 MOCK_DAY_IDX = 0
@@ -270,6 +270,142 @@ def draw_bracket_text_node(
         stroke_fill=color_scheme["canvas_color"],
     )
 
+def draw_missing_image_fallback(
+    draw, name, box_rect, font, border_color="#ff5555"
+):
+    """Draws an error border box and missing name label if an image fails to load."""
+    draw.rectangle(box_rect, outline=border_color, width=4)
+
+    box_left, box_top, box_right, box_bottom = box_rect
+    center_x = box_left + (box_right - box_left) // 2
+    center_y = box_top + (box_bottom - box_top) // 2
+
+    error_msg = f"[missing image for\n{name}]"
+    draw.text(
+        (center_x, center_y),
+        error_msg,
+        fill=border_color,
+        font=font,
+        anchor="mm",
+        align="center",
+    )
+
+def draw_single_line_layered(
+    draw_obj,
+    position,
+    text,
+    font,
+    main_color,
+    stroke_color,
+    stroke_width,
+    bg_padding=(18, 8),
+    bg_color=(15, 15, 22),
+    anchor="mm",
+):
+    """Draws a line of text with its own individual backing box to block underlying image details."""
+    x, y = position
+
+    # 1. Measure the exact line width and height for a tight per-line box
+    bbox = font.getbbox(text)
+    text_w = bbox[2] - bbox[0]
+
+    try:
+        ascent, descent = font.getmetrics()
+        text_h = ascent + descent
+    except AttributeError:
+        text_h = bbox[3] - bbox[1]
+
+    # pad_x, pad_y = int(bg_padding[0] * 0), int(bg_padding[1] * 0)
+    # box_left = x - (text_w // 2) - pad_x - stroke_width*0
+    # box_top = y - (text_h // 2) - pad_y
+    # box_right = x + (text_w // 2) + pad_x + stroke_width*0
+    # box_bottom = y + (text_h // 2) + pad_y
+
+    box_left = x - (text_w // 2) *0.95
+    box_top = y - (text_h // 2) *0.75
+    box_right = x + (text_w // 2) *0.95
+    box_bottom = y + (text_h // 2) *0.75
+
+    # 2. Draw tight individual backing box
+    draw_obj.rounded_rectangle(
+        [box_left, box_top, box_right, box_bottom],
+        radius=8,
+        fill=bg_color,
+        outline="#000000",
+        width=1,
+    )
+
+    # 3. Outer Outline Stroke
+    draw_obj.text(
+        (x, y),
+        text,
+        font=font,
+        fill=main_color,
+        anchor=anchor,
+        stroke_width=stroke_width,
+        stroke_fill=stroke_color,
+    )
+
+    # 4. Solid Black Inner Fill
+    draw_obj.text(
+        (x, y),
+        text,
+        font=font,
+        fill=stroke_color,
+        anchor=anchor,
+        stroke_width=0,
+    )
+
+    # 5. Top Text Color
+    draw_obj.text(
+        (x, y), text, font=font, fill=main_color, anchor=anchor, stroke_width=0
+    )
+
+
+def draw_multiline_text_layered(
+    draw_obj,
+    center_position,
+    lines,
+    font,
+    main_color,
+    stroke_color,
+    stroke_width,
+    line_spacing=1.2,
+    bg_padding=(20, 10),
+    bg_color=(15, 15, 22),
+):
+    """Renders multiline text where every line gets its own custom-fit backing box."""
+    center_x, center_y = center_position
+
+    try:
+        ascent, descent = font.getmetrics()
+        line_height = int((ascent + descent) * line_spacing)
+    except AttributeError:
+        line_height = int(50 * line_spacing)
+
+    total_lines = len(lines)
+    start_y = center_y - ((total_lines - 1) * line_height // 2)
+
+    for i, line_text in enumerate(lines):
+        if not line_text.strip():  # Skip empty spacing lines
+            continue
+        line_y = start_y + (i * line_height)
+        draw_single_line_layered(
+            draw_obj=draw_obj,
+            position=(center_x, line_y),
+            text=line_text,
+            font=font,
+            main_color=main_color,
+            stroke_color=stroke_color,
+            stroke_width=stroke_width,
+            bg_padding=bg_padding,
+            bg_color=bg_color,
+            anchor="mm",
+        )
+
+
+
+
 def generate_bracket_graphic(state, color_scheme):
     width, height = 1200, 800
 
@@ -470,128 +606,50 @@ def get_daily_theme():
     return THEMES[(date_to_integer(datetime.now())) % len(THEMES)]
 
 def generate_matchup_graphic(match_label, left_name, right_name):
-    """
-    Creates a 1200x800 canvas with left and right celebrity photos side-by-side.
-    Guaranteed not to crash if either photo is missing, deleted, or corrupted.
-    """
+    """Creates a 1200x800 canvas with left and right celebrity photos side-by-side."""
     canvas_w, canvas_h = 1200, 800
-    top_margin = 4
-    side_margin = 4
-    spacing = 2
+    top_margin, side_margin, spacing = 4, 4, 2
 
-    # Calculate target dimensions for each side lane
+    # Calculate dimensions for each side lane
     photo_w = (canvas_w - (side_margin * 2) - spacing) // 2
     photo_h = canvas_h - top_margin - side_margin
 
-    # 1. Initialize canvas background frame
+    # 1. Canvas Setup
     img = Image.new("RGB", (canvas_w, canvas_h), color="#1e1f29")
     draw = ImageDraw.Draw(img)
+    font, fallback_font = load_graphic_fonts()
 
-    # 2. Load fonts
-    try:
-        font = ImageFont.truetype("/System/Library/Fonts/Arial Bold.ttf", size=50)
-        fallback_font = ImageFont.truetype(
-            "/System/Library/Fonts/Arial Bold.ttf", size=30
-        )
-    except Exception:
-        font = ImageFont.load_default()
-        fallback_font = ImageFont.load_default()
+    # 2. Process Left & Right Lanes
+    left_box = (side_margin, top_margin, photo_w, photo_h)
+    right_box = (side_margin + photo_w + spacing, top_margin, photo_w, photo_h)
 
-    # 3. Process Left Side Photo Safely
-    left_path = get_celebrity_image_path(left_name)
-    left_loaded = False
+    paste_celebrity_side_lane(img, draw, left_name, left_box, fallback_font)
+    paste_celebrity_side_lane(img, draw, right_name, right_box, fallback_font)
 
-    if left_path and left_path.exists():
-        try:
-            with Image.open(left_path) as left_img:
-                left_img.thumbnail((photo_w, photo_h))
-                x_pos = side_margin + (photo_w - left_img.width) // 2
-                y_pos = top_margin + (photo_h - left_img.height) // 2
-                img.paste(left_img, (x_pos, y_pos))
-                left_loaded = True
-        except Exception as img_err:
-            print(
-                f"⚠️ Warning: Left image for '{left_name}' exists but failed to open: {img_err}"
-            )
+   
+    # 3. Layered Text Overlay
+    lines = [match_label.upper(), "", left_name, "versus", right_name]
 
-    if not left_loaded:
-        # Visual fallback block displaying the specific celebrity name instead of crashing
-        draw.rectangle(
-            [side_margin, top_margin, side_margin + photo_w, top_margin + photo_h],
-            outline="#ff5555",
-            width=4,
-        )
-        error_msg = f"[missing image for\n{left_name}]"
-        draw.text(
-            (side_margin + photo_w // 2, top_margin + photo_h // 2),
-            error_msg,
-            fill="#ff5555",
-            font=fallback_font,
-            anchor="mm",
-            align="center",
-        )
-
-    # 4. Process Right Side Photo Safely
-    right_path = get_celebrity_image_path(right_name)
-    right_loaded = False
-
-    if right_path and right_path.exists():
-        try:
-            with Image.open(right_path) as right_img:
-                right_img.thumbnail((photo_w, photo_h))
-                x_pos = (
-                    side_margin + photo_w + spacing + (photo_w - right_img.width) // 2
-                )
-                y_pos = top_margin + (photo_h - right_img.height) // 2
-                img.paste(right_img, (x_pos, y_pos))
-                right_loaded = True
-        except Exception as img_err:
-            print(
-                f"⚠️ Warning: Right image for '{right_name}' exists but failed to open: {img_err}"
-            )
-
-    if not right_loaded:
-        # Visual fallback block displaying the specific celebrity name instead of crashing
-        x_start = side_margin + photo_w + spacing
-        draw.rectangle(
-            [x_start, top_margin, x_start + photo_w, top_margin + photo_h],
-            outline="#ff5555",
-            width=4,
-        )
-        error_msg = f"[missing image for\n{right_name}]"
-        draw.text(
-            (x_start + photo_w // 2, top_margin + photo_h // 2),
-            error_msg,
-            fill="#ff5555",
-            font=fallback_font,
-            anchor="mm",
-            align="center",
-        )
-
-    # 5. Centered text overlay
-    overlay_text = f"{match_label.upper()}\n\n{left_name}\nversus\n{right_name}"
-    draw.text(
-        (canvas_w // 2, canvas_h // 2),
-        overlay_text,
-        fill="#ffeeff",
+    draw_multiline_text_layered(
+        draw_obj=draw,
+        center_position=(canvas_w // 2, canvas_h // 2),
+        lines=lines,
         font=font,
-        anchor="mm",
-        align="center",
-        stroke_width=15,  # Thickness of the outline stroke
-        stroke_fill="#000000",  # Color of the outline
+        main_color="#ffeeff",
+        stroke_color="#000000",
+        stroke_width=15,
+        line_spacing=1.1,
     )
 
-    # 6. Save out the final compilation image asset
+    # 4. Save Image Asset
     output_path = SCRIPT_DIR / "jeff_matchup.png"
-    alt_text = ""
     try:
         img.save(output_path)
         print(f"🎉 Matchup graphic successfully saved to: {output_path}")
-        alt_text = f"Side by side celebrity matchup photos for {match_label}: {left_name} vs {right_name}"
+        return f"Side by side celebrity matchup photos for {match_label}: {left_name} vs {right_name}"
     except Exception as save_err:
         print(f"❌ Critical error saving compilation image to disk: {save_err}")
-
-    return alt_text
+        return ""
 
 
 def get_random_question():
@@ -648,9 +706,19 @@ def get_poll_winner(poll_id, match_details):
         if not poll:
             return None
 
-        # 🚨 SAFETY CHECK: If the poll is still active, do NOT tally the votes yet!
-        if not poll.get("expired", False):
-            print(f"⚠️ Warning: Poll {poll_id} is still open. Waiting until it closes.")
+        # Check if poll is expired OR if current time is past expiration + 1 min buffer
+        now = datetime.now(timezone.utc)
+        poll_expired = poll.get("expired", False)
+
+        if not poll_expired and poll.get("expires_at"):
+            expires_at = datetime.fromisoformat(
+                poll["expires_at"].replace("Z", "+00:00")
+            )
+            if now >= expires_at:
+                poll_expired = True  # Force expiration check past scheduled end time
+
+        if not poll_expired:
+            print(f"⏳ Poll {poll_id} is still marked active by Mastodon.")
             return None
 
         options = poll["options"]
@@ -760,11 +828,58 @@ def initialize_new_bracket():
 
     return state
 
+def load_graphic_fonts():
+    """Loads Arial Bold at primary and fallback sizes, with PIL default fallback."""
+    try:
+        font = ImageFont.truetype(
+            "/System/Library/Fonts/Arial Bold.ttf", size=50
+        )
+        fallback_font = ImageFont.truetype(
+            "/System/Library/Fonts/Arial Bold.ttf", size=30
+        )
+    except Exception:
+        font = ImageFont.load_default()
+        fallback_font = ImageFont.load_default()
+    return font, fallback_font
+
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     return None
+
+def paste_celebrity_side_lane(
+    canvas_img, draw_obj, name, target_box, fallback_font
+):
+    """Attempts to load, resize, and center a celebrity photo into its half-lane.
+
+    Falls back to a visual error box if the image is missing or corrupt.
+    """
+    box_left, box_top, photo_w, photo_h = target_box
+    image_path = get_celebrity_image_path(name)
+
+    if image_path and image_path.exists():
+        try:
+            with Image.open(image_path) as celeb_img:
+                celeb_img.thumbnail((photo_w, photo_h))
+
+                # Center within assigned half-lane
+                x_pos = box_left + (photo_w - celeb_img.width) // 2
+                y_pos = box_top + (photo_h - celeb_img.height) // 2
+
+                canvas_img.paste(celeb_img, (x_pos, y_pos))
+                return True
+        except Exception as img_err:
+            print(
+                f"⚠️ Warning: Image for '{name}' exists but failed to open: {img_err}"
+            )
+
+    # Render fallback box if missing or unreadable
+    fallback_rect = [box_left, box_top, box_left + photo_w, box_top + photo_h]
+    draw_missing_image_fallback(
+        draw_obj, name, fallback_rect, fallback_font
+    )
+    return False
 
 
 def post_monday_wrapup(state):
@@ -870,7 +985,7 @@ def process_chart_stage(state, match_key):
             break
     return False
 
-import traceback
+
 
 
 def process_match_stage(state, match_key):
@@ -1060,7 +1175,11 @@ def main():
             winner = get_poll_winner(match["poll_id"], match)
             if winner:
                 match["winner"] = winner
-                print(f"Resolved {match['label']}: Winner is {winner}")
+                print(f"✅ Resolved {match['label']}: Winner is {winner}")
+            else:
+                print(
+                    f"⏳ Checked {match['label']} (Poll {match['poll_id']}), but poll is not finalized yet."
+                )
 
     if state["matches"]["0"]["winner"]: state["matches"]["4"]["home"] = state["matches"]["0"]["winner"]
     if state["matches"]["1"]["winner"]: state["matches"]["4"]["away"] = state["matches"]["1"]["winner"]
@@ -1168,3 +1287,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # alt_text = generate_matchup_graphic(
+    #     match_label="Quarterfinal 2",
+    #     left_name="Jeff Goldblum",
+    #     right_name="Jeff Bridges"
+    # )
